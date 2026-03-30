@@ -449,6 +449,96 @@ def init_db() -> None:
             ("bailian", "qwen-plus", 1, 50, 0.0012, 0.0024, now_iso()),
         )
         conn.commit()
+
+    # --- Inventory stock management (new) ---
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inventory_stock_batches (
+            id TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            total_rows INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inventory_stock_main_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            analysis_main_code TEXT NOT NULL,
+            merged_codes_raw TEXT,
+            department TEXT,
+            product_tag TEXT,
+            product_name TEXT,
+            supply_department TEXT,
+            buyer TEXT,
+            manufacturer TEXT,
+            group_inventory_status TEXT,
+            turnover_lt_15 INTEGER,
+            sellable_stock REAL,
+            kunshan_in_transit REAL,
+            last_month_customer_count REAL,
+            last_month_gm REAL,
+            last_month_gmv REAL,
+            last_month_revenue REAL,
+            last_month_sales_qty REAL,
+            jbp3_available REAL,
+            ytd_customer_count REAL,
+            ytd_sales_qty REAL,
+            ytd_revenue REAL,
+            ytd_gmv REAL,
+            ytd_gaap_profit REAL,
+            turnover_days REAL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inventory_stock_code_map (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            analysis_main_code TEXT NOT NULL,
+            standard_code TEXT NOT NULL,
+            sellable_stock REAL NOT NULL DEFAULT 0,
+            jbp3_available REAL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inventory_reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT,
+            reminder_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            target_analysis_main_code TEXT,
+            target_department TEXT,
+            target_product_tag TEXT,
+            due_at TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            metadata_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    # ensure new columns exist on incremental upgrades
+    cols_stock = [r["name"] for r in cur.execute("PRAGMA table_info(inventory_stock_main_codes)").fetchall()]
+    if "last_month_customer_count" not in cols_stock:
+        cur.execute("ALTER TABLE inventory_stock_main_codes ADD COLUMN last_month_customer_count REAL")
+    if "last_month_gm" not in cols_stock:
+        cur.execute("ALTER TABLE inventory_stock_main_codes ADD COLUMN last_month_gm REAL")
+    if "last_month_gmv" not in cols_stock:
+        cur.execute("ALTER TABLE inventory_stock_main_codes ADD COLUMN last_month_gmv REAL")
+    if "last_month_revenue" not in cols_stock:
+        cur.execute("ALTER TABLE inventory_stock_main_codes ADD COLUMN last_month_revenue REAL")
+    if "last_month_sales_qty" not in cols_stock:
+        cur.execute("ALTER TABLE inventory_stock_main_codes ADD COLUMN last_month_sales_qty REAL")
     conn.close()
 
 
@@ -524,8 +614,35 @@ def to_float(v: Any, default: float = 0) -> float:
         return default
 
 
+def to_int_flag(v: Any, default: int = 0) -> int:
+    if v in (None, ""):
+        return default
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "是", "有"):
+        return 1
+    if "15" in s and ("<" in s or "≤" in s or "<=" in s):
+        return 1
+    try:
+        return 1 if float(s) > 0 else 0
+    except Exception:
+        return default
+
+
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+def _quantile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    arr = sorted(values)
+    if len(arr) == 1:
+        return float(arr[0])
+    pos = q * (len(arr) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(arr) - 1)
+    frac = pos - lo
+    return float(arr[lo] * (1 - frac) + arr[hi] * frac)
 
 
 def _get_llm_setting() -> dict[str, Any]:
@@ -1626,6 +1743,689 @@ async def ops_inventory_upload(
     return await ops_upload_library(file=file, default_role=default_role)
 
 
+def _latest_inventory_stock_batch_id() -> str | None:
+    conn = db_conn()
+    cur = conn.cursor()
+    row = cur.execute(
+        "SELECT id FROM inventory_stock_batches ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    return str(row["id"]) if row is not None and row["id"] is not None else None
+
+
+def _get_available_standard_code_set(stock_batch_id: str) -> set[str]:
+    conn = db_conn()
+    cur = conn.cursor()
+    rows = cur.execute(
+        "SELECT DISTINCT standard_code FROM inventory_stock_code_map WHERE batch_id=? AND sellable_stock>0",
+        (stock_batch_id,),
+    ).fetchall()
+    conn.close()
+    return set(
+        str(r["standard_code"])
+        for r in rows
+        if r["standard_code"] is not None and str(r["standard_code"]).strip() != ""
+    )
+
+
+def _parse_numeric_parts(raw: str) -> list[str]:
+    if not raw:
+        return []
+    parts = []
+    for p in str(raw).split("/"):
+        p = p.strip()
+        if p and p.isdigit():
+            parts.append(p)
+    # de-dup but keep order
+    return list(dict.fromkeys(parts))
+
+
+@app.post("/api/ops/inventory/stock/upload")
+async def ops_stock_upload(
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    if not file.filename.lower().endswith((".xlsx", ".xlsm", ".xltx", ".xltm")):
+        raise HTTPException(status_code=400, detail="仅支持 Excel 文件(.xlsx)")
+
+    try:
+        from openpyxl import load_workbook
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="缺少 openpyxl 依赖") from exc
+
+    content = await file.read()
+    wb = load_workbook(io.BytesIO(content), read_only=False, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        raise HTTPException(status_code=400, detail="文件为空")
+
+    headers = [str(x).strip() if x is not None else "" for x in rows[0]]
+    idx = lambda cands: find_col_idx(headers, cands)
+
+    analysis_idx = idx({"分析主码", "分析码"})
+    merged_idx = idx({"合并主码", "合并码"})
+    dept_idx = idx({"科室", "department", "科室名称"})
+    tag_idx = idx({"产品标签", "label", "标签"})
+    name_idx = idx({"产品名称", "商品名称", "药品名称", "名称"})
+    mfr_idx = idx({"生产企业", "生产厂商", "厂商", "厂家"})
+    group_status_idx = idx({"集团分析主码库存状态", "库存状态", "主码库存状态"})
+    lt15_idx = idx({"周转<15天", "周转<15", "周转_lt_15"})
+    sellable_idx = idx({"可售库存", "可售", "可用库存"})
+    transit_idx = idx({"昆山药缘在途", "在途", "在途数量"})
+    jbp_idx = idx({"JBP3仓可用库存", "JBP3可用库存"})
+    turnover_days_idx = idx({"周转天数", "周转天"})
+
+    ytd_cust_idx = idx({"YTD-顾客数", "YTD顾客数"})
+    ytd_sales_idx = idx({"YTD-销量", "YTD销量"})
+    ytd_rev_idx = idx({"YTD-Revenue", "YTD收入", "YTD-Rev"})
+    ytd_gmv_idx = idx({"YTD-GMV", "YTD销售额"})
+    ytd_profit_idx = idx({"YTD-GAAP毛利额(去税)", "YTD-GAAP毛利额", "YTD毛利额(去税)"})
+    lm_cust_idx = idx({"药网上月顾客数", "上月顾客数", "月顾客数"})
+    lm_gm_idx = idx({"药网上月GM", "上月GM"})
+    lm_gmv_idx = idx({"药网上月GMV", "上月GMV"})
+    lm_rev_idx = idx({"药网上月Revenue", "上月Revenue", "上月收入"})
+    lm_sales_idx = idx({"药网上月销量", "上月销量"})
+
+    missing: list[str] = []
+    if analysis_idx is None:
+        missing.append("分析主码")
+    if merged_idx is None:
+        missing.append("合并主码")
+    if dept_idx is None:
+        missing.append("科室")
+    if tag_idx is None:
+        missing.append("产品标签")
+    if name_idx is None:
+        missing.append("产品名称")
+    if sellable_idx is None:
+        missing.append("可售库存")
+    if jbp_idx is None:
+        missing.append("JBP3仓可用库存")
+    if ytd_gmv_idx is None:
+        missing.append("YTD-GMV")
+    if ytd_profit_idx is None:
+        missing.append("YTD-GAAP毛利额(去税)")
+    if missing:
+        raise HTTPException(status_code=400, detail=f"缺少关键字段：{', '.join(missing)}")
+
+    stock_batch_id = f"stock_{uuid.uuid4().hex[:10]}"
+    now = now_iso()
+
+    main_upserts: list[tuple] = []
+    map_upserts: list[tuple] = []
+
+    valid_rows = 0
+    for row in rows[1:]:
+        if not row:
+            continue
+        analysis_main_code = str(row[analysis_idx]).strip() if row[analysis_idx] is not None else ""
+        if not analysis_main_code:
+            continue
+        merged_codes_raw = str(row[merged_idx]).strip() if row[merged_idx] is not None else ""
+        department = str(row[dept_idx]).strip() if dept_idx is not None and row[dept_idx] is not None else "未分类"
+        product_tag = str(row[tag_idx]).strip() if tag_idx is not None and row[tag_idx] is not None else ""
+        product_name = str(row[name_idx]).strip() if name_idx is not None and row[name_idx] is not None else ""
+        if not product_name:
+            continue
+
+        manufacturer = str(row[mfr_idx]).strip() if mfr_idx is not None and row[mfr_idx] is not None else ""
+        group_inventory_status = (
+            str(row[group_status_idx]).strip() if group_status_idx is not None and row[group_status_idx] is not None else ""
+        )
+
+        turnover_lt_15 = to_int_flag(row[lt15_idx], 0) if lt15_idx is not None else 0
+        sellable_stock = to_float(row[sellable_idx], 0) if sellable_idx is not None else 0
+        kunshan_in_transit = to_float(row[transit_idx], 0) if transit_idx is not None else 0
+        jbp3_available = to_float(row[jbp_idx], 0) if jbp_idx is not None else 0
+        turnover_days = to_float(row[turnover_days_idx], 0) if turnover_days_idx is not None else 0
+
+        ytd_customer_count = to_float(row[ytd_cust_idx], 0) if ytd_cust_idx is not None else 0
+        ytd_sales_qty = to_float(row[ytd_sales_idx], 0) if ytd_sales_idx is not None else 0
+        ytd_revenue = to_float(row[ytd_rev_idx], 0) if ytd_rev_idx is not None else 0
+        ytd_gmv = to_float(row[ytd_gmv_idx], 0) if ytd_gmv_idx is not None else 0
+        ytd_gaap_profit = to_float(row[ytd_profit_idx], 0) if ytd_profit_idx is not None else 0
+        last_month_customer_count = to_float(row[lm_cust_idx], 0) if lm_cust_idx is not None else 0
+        last_month_gm = to_float(row[lm_gm_idx], 0) if lm_gm_idx is not None else 0
+        last_month_gmv = to_float(row[lm_gmv_idx], 0) if lm_gmv_idx is not None else 0
+        last_month_revenue = to_float(row[lm_rev_idx], 0) if lm_rev_idx is not None else 0
+        last_month_sales_qty = to_float(row[lm_sales_idx], 0) if lm_sales_idx is not None else 0
+
+        supply_department = str(row[idx({"供给部门新", "供给部门"})] ).strip() if idx({"供给部门新","供给部门"}) is not None and row[idx({"供给部门新","供给部门"})] is not None else ""
+        buyer = str(row[idx({"采购员新", "采购员"})]).strip() if idx({"采购员新","采购员"}) is not None and row[idx({"采购员新","采购员"})] is not None else ""
+
+        main_upserts.append(
+            (
+                stock_batch_id,
+                analysis_main_code,
+                merged_codes_raw,
+                department,
+                product_tag,
+                product_name,
+                supply_department,
+                buyer,
+                manufacturer,
+                group_inventory_status,
+                turnover_lt_15,
+                sellable_stock,
+                kunshan_in_transit,
+                last_month_customer_count,
+                last_month_gm,
+                last_month_gmv,
+                last_month_revenue,
+                last_month_sales_qty,
+                jbp3_available,
+                ytd_customer_count,
+                ytd_sales_qty,
+                ytd_revenue,
+                ytd_gmv,
+                ytd_gaap_profit,
+                turnover_days,
+                now,
+                now,
+            )
+        )
+
+        for standard_code in _parse_numeric_parts(merged_codes_raw):
+            map_upserts.append((stock_batch_id, analysis_main_code, standard_code, sellable_stock, jbp3_available, now))
+
+        valid_rows += 1
+
+    if valid_rows == 0:
+        raise HTTPException(status_code=400, detail="没有解析到有效数据行")
+
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO inventory_stock_batches (id, filename, total_rows, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (stock_batch_id, file.filename, valid_rows, now),
+    )
+    cur.executemany(
+        """
+        INSERT INTO inventory_stock_main_codes (
+          batch_id, analysis_main_code, merged_codes_raw, department, product_tag, product_name,
+          supply_department, buyer, manufacturer, group_inventory_status,
+          turnover_lt_15, sellable_stock, kunshan_in_transit,
+          last_month_customer_count, last_month_gm, last_month_gmv, last_month_revenue, last_month_sales_qty,
+          jbp3_available,
+          ytd_customer_count, ytd_sales_qty, ytd_revenue, ytd_gmv, ytd_gaap_profit,
+          turnover_days, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        main_upserts,
+    )
+    if map_upserts:
+        cur.executemany(
+            """
+            INSERT INTO inventory_stock_code_map (
+              batch_id, analysis_main_code, standard_code, sellable_stock, jbp3_available, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            map_upserts,
+        )
+    conn.commit()
+
+    # Create reminders:
+    # - out-of-stock: sellable_stock <= 0
+    # - low stock: Kunshan (JBP3) turnover <= 15 days, based on last month sales
+    reminder_created = 0
+    tag_reminder_created = 0
+    low_stock_reminder_created = 0
+    out_of_stock_main_ids = cur.execute(
+        "SELECT analysis_main_code, department, product_tag, product_name, sellable_stock, ytd_gmv FROM inventory_stock_main_codes WHERE batch_id=? AND sellable_stock<=0 ORDER BY ytd_gmv DESC",
+        (stock_batch_id,),
+    ).fetchall()
+    low_stock_main_ids = cur.execute(
+        """
+        SELECT analysis_main_code, department, product_tag, product_name, jbp3_available, last_month_sales_qty, ytd_gmv
+        FROM inventory_stock_main_codes
+        WHERE batch_id=?
+          AND sellable_stock>0
+          AND last_month_sales_qty>0
+          AND (jbp3_available * 30.0 / last_month_sales_qty) <= 15
+          AND jbp3_available >= 0
+        ORDER BY ytd_gmv DESC
+        """,
+        (stock_batch_id,),
+    ).fetchall()
+
+    # Aggregate reminder by product_tag (for quick action)
+    tag_rows = cur.execute(
+        """
+        SELECT product_tag, COUNT(*) AS sku_count, SUM(CASE WHEN sellable_stock<=0 THEN 1 ELSE 0 END) AS oos_count,
+               SUM(ytd_customer_count) AS ytd_customer_sum, SUM(ytd_gmv) AS ytd_gmv_sum
+        FROM inventory_stock_main_codes
+        WHERE batch_id=?
+        GROUP BY product_tag
+        """,
+        (stock_batch_id,),
+    ).fetchall()
+    for t in tag_rows:
+        tag = t["product_tag"] or ""
+        oos_count = int(t["oos_count"] or 0)
+        if not tag or oos_count <= 0:
+            continue
+        meta = json.dumps(
+            {"product_tag": tag, "sku_count": int(t["sku_count"] or 0), "oos_count": oos_count, "ytd_gmv_sum": float(t["ytd_gmv_sum"] or 0)},
+            ensure_ascii=False,
+        )
+        cur.execute(
+            """
+            INSERT INTO inventory_reminders (
+              batch_id, reminder_type, title, target_analysis_main_code, target_department, target_product_tag,
+              due_at, status, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, NULL, ?, ?, ?, 'open', ?, ?, ?)
+            """,
+            (stock_batch_id, "oos_tag", f"[{tag}] 缺货补货跟进", t["department"] if "department" in t.keys() else "", tag, None, meta, now, now),
+        )
+        tag_reminder_created += 1
+
+    # Aggregate low-stock reminder by product_tag
+    low_tag_rows = cur.execute(
+        """
+        SELECT product_tag, COUNT(*) AS sku_count
+        FROM inventory_stock_main_codes
+        WHERE batch_id=?
+          AND sellable_stock>0
+          AND last_month_sales_qty>0
+          AND (jbp3_available * 30.0 / last_month_sales_qty) <= 15
+          AND jbp3_available >= 0
+        GROUP BY product_tag
+        """,
+        (stock_batch_id,),
+    ).fetchall()
+    for t in low_tag_rows:
+        tag = t["product_tag"] or ""
+        low_count = int(t["sku_count"] or 0)
+        if not tag or low_count <= 0:
+            continue
+        meta = json.dumps(
+            {"product_tag": tag, "low_stock_count": low_count, "rule": "kunshan_turnover<=15"},
+            ensure_ascii=False,
+        )
+        cur.execute(
+            """
+            INSERT INTO inventory_reminders (
+              batch_id, reminder_type, title, target_analysis_main_code, target_department, target_product_tag,
+              due_at, status, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, NULL, ?, ?, ?, 'open', ?, ?, ?)
+            """,
+            (stock_batch_id, "low_stock_tag", f"[{tag}] 低库存补货跟进（周转<=15天）", "", tag, None, meta, now, now),
+        )
+        low_stock_reminder_created += 1
+
+    # Top code reminders (limit to avoid noise)
+    top_limit = 50
+    for r in out_of_stock_main_ids[:top_limit]:
+        meta = json.dumps({"ytd_gmv": float(r["ytd_gmv"] or 0)}, ensure_ascii=False)
+        cur.execute(
+            """
+            INSERT INTO inventory_reminders (
+              batch_id, reminder_type, title, target_analysis_main_code, target_department, target_product_tag,
+              due_at, status, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+            """,
+            (
+                stock_batch_id,
+                "oos_code",
+                f"{r['product_name']} 缺货补货跟进",
+                r["analysis_main_code"],
+                r["department"],
+                r["product_tag"],
+                None,
+                meta,
+                now,
+                now,
+            ),
+        )
+        reminder_created += 1
+
+    # Top low-stock code reminders (limit to avoid noise)
+    low_top_limit = 50
+    for r in low_stock_main_ids[:low_top_limit]:
+        meta = json.dumps(
+            {
+                "rule": "kunshan_turnover<=15",
+                "jbp3_available": float(r["jbp3_available"] or 0),
+                "last_month_sales_qty": float(r["last_month_sales_qty"] or 0),
+                "est_turnover_days_kunshan": round((float(r["jbp3_available"] or 0) * 30.0 / float(r["last_month_sales_qty"] or 1)), 2),
+                "ytd_gmv": float(r["ytd_gmv"] or 0),
+            },
+            ensure_ascii=False,
+        )
+        cur.execute(
+            """
+            INSERT INTO inventory_reminders (
+              batch_id, reminder_type, title, target_analysis_main_code, target_department, target_product_tag,
+              due_at, status, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+            """,
+            (
+                stock_batch_id,
+                "low_stock_code",
+                f"{r['product_name']} 低库存补货跟进（周转<=15天）",
+                r["analysis_main_code"],
+                r["department"],
+                r["product_tag"],
+                None,
+                meta,
+                now,
+                now,
+            ),
+        )
+        low_stock_reminder_created += 1
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "batch_id": stock_batch_id,
+        "imported": valid_rows,
+        "mapped_standard_codes": len(map_upserts),
+        "reminder_created": reminder_created + tag_reminder_created + low_stock_reminder_created,
+        "tag_reminder_created": tag_reminder_created,
+        "code_reminder_created": reminder_created,
+        "low_stock_reminder_created": low_stock_reminder_created,
+    }
+
+
+@app.get("/api/ops/inventory/stock/dashboard")
+def ops_stock_dashboard() -> dict[str, Any]:
+    stock_batch_id = _latest_inventory_stock_batch_id()
+    if not stock_batch_id:
+        return {"stock_batch_id": None, "items": [], "totals": {}}
+    conn = db_conn()
+    cur = conn.cursor()
+    # totals
+    totals = cur.execute(
+        """
+        SELECT
+          COUNT(*) AS sku_count,
+          SUM(CASE WHEN sellable_stock<=0 THEN 1 ELSE 0 END) AS oos_count,
+          SUM(CASE WHEN sellable_stock>0 AND last_month_sales_qty>0 AND jbp3_available>=0 AND (jbp3_available * 30.0 / last_month_sales_qty)<=15 THEN 1 ELSE 0 END) AS low_stock_count,
+          SUM(sellable_stock) AS sellable_stock_sum,
+          SUM(kunshan_in_transit) AS in_transit_sum,
+          SUM(jbp3_available) AS kunshan_stock_sum,
+          SUM(last_month_sales_qty) AS lm_sales_sum,
+          SUM(last_month_gmv) AS lm_gmv_sum,
+          SUM(last_month_gm) AS lm_gm_sum,
+          SUM(ytd_customer_count) AS ytd_customer_sum,
+          SUM(ytd_sales_qty) AS ytd_sales_sum,
+          SUM(ytd_gmv) AS ytd_gmv_sum,
+          SUM(ytd_revenue) AS ytd_revenue_sum,
+          SUM(ytd_gaap_profit) AS ytd_profit_sum
+        FROM inventory_stock_main_codes
+        WHERE batch_id=?
+        """,
+        (stock_batch_id,),
+    ).fetchone()
+
+    # group by product_tag
+    rows = cur.execute(
+        """
+        SELECT
+          product_tag,
+          COUNT(*) AS sku_count,
+          SUM(CASE WHEN sellable_stock<=0 THEN 1 ELSE 0 END) AS oos_count,
+          SUM(CASE WHEN sellable_stock>0 AND last_month_sales_qty>0 AND jbp3_available>=0 AND (jbp3_available * 30.0 / last_month_sales_qty)<=15 THEN 1 ELSE 0 END) AS low_stock_count,
+          SUM(sellable_stock) AS sellable_stock_sum,
+          SUM(kunshan_in_transit) AS in_transit_sum,
+          SUM(jbp3_available) AS kunshan_stock_sum,
+          SUM(last_month_sales_qty) AS lm_sales_sum,
+          SUM(last_month_gmv) AS lm_gmv_sum,
+          SUM(last_month_gm) AS lm_gm_sum,
+          SUM(CASE WHEN sellable_stock<=0 THEN last_month_sales_qty ELSE 0 END) AS oos_lm_sales_sum,
+          SUM(CASE WHEN sellable_stock<=0 THEN last_month_gmv ELSE 0 END) AS oos_lm_gmv_sum,
+          SUM(CASE WHEN sellable_stock<=0 THEN last_month_gm ELSE 0 END) AS oos_lm_gm_sum,
+          SUM(ytd_customer_count) AS ytd_customer_sum,
+          SUM(ytd_sales_qty) AS ytd_sales_sum,
+          SUM(ytd_gmv) AS ytd_gmv_sum,
+          SUM(ytd_revenue) AS ytd_revenue_sum,
+          SUM(ytd_gaap_profit) AS ytd_profit_sum
+        FROM inventory_stock_main_codes
+        WHERE batch_id=?
+        GROUP BY product_tag
+        ORDER BY oos_count DESC, ytd_gmv_sum DESC
+        """,
+        (stock_batch_id,),
+    ).fetchall()
+    conn.close()
+    day_of_year = max(datetime.now().timetuple().tm_yday, 1)
+    # code-level stats for robust turnover (avoid long-tail no-sales distortion)
+    conn3 = db_conn()
+    cur3 = conn3.cursor()
+    code_rows = cur3.execute(
+        """
+        SELECT product_tag, turnover_days, last_month_sales_qty, jbp3_available
+        FROM inventory_stock_main_codes
+        WHERE batch_id=?
+        """,
+        (stock_batch_id,),
+    ).fetchall()
+    conn3.close()
+    tag_turnover_vals: dict[str, list[float]] = {}
+    tag_active_sales_sum: dict[str, float] = {}
+    tag_active_stock_sum: dict[str, float] = {}
+    tag_active_sku_count: dict[str, int] = {}
+    tag_no_sales_sku_count: dict[str, int] = {}
+    all_turnover_vals: list[float] = []
+    total_active_sales_sum = 0.0
+    total_active_stock_sum = 0.0
+    total_active_sku_count = 0
+    total_no_sales_sku_count = 0
+    for r in code_rows:
+        tag = str(r["product_tag"] or "")
+        td = float(r["turnover_days"] or 0)
+        lm_sales = float(r["last_month_sales_qty"] or 0)
+        stock = float(r["jbp3_available"] or 0)
+        if td > 0:
+            tag_turnover_vals.setdefault(tag, []).append(td)
+            all_turnover_vals.append(td)
+        if lm_sales > 0:
+            tag_active_sales_sum[tag] = tag_active_sales_sum.get(tag, 0.0) + lm_sales
+            tag_active_stock_sum[tag] = tag_active_stock_sum.get(tag, 0.0) + stock
+            tag_active_sku_count[tag] = tag_active_sku_count.get(tag, 0) + 1
+            total_active_sales_sum += lm_sales
+            total_active_stock_sum += stock
+            total_active_sku_count += 1
+        else:
+            tag_no_sales_sku_count[tag] = tag_no_sales_sku_count.get(tag, 0) + 1
+            total_no_sales_sku_count += 1
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        sku = int(r["sku_count"] or 0)
+        oos = int(r["oos_count"] or 0)
+        low = int(r["low_stock_count"] or 0)
+        rate = round((oos / sku), 4) if sku > 0 else 0.0
+        low_rate = round((low / sku), 4) if sku > 0 else 0.0
+        tag = str(r["product_tag"] or "")
+        active_sales = float(tag_active_sales_sum.get(tag, 0.0))
+        active_stock = float(tag_active_stock_sum.get(tag, 0.0))
+        lm_daily_sales_active = active_sales / 30.0
+        est_turnover_days_active = (active_stock / lm_daily_sales_active) if lm_daily_sales_active > 0 else 0.0
+        p50 = _quantile(tag_turnover_vals.get(tag, []), 0.5)
+        p75 = _quantile(tag_turnover_vals.get(tag, []), 0.75)
+        items.append(
+            {
+                "product_tag": tag,
+                "sku_count": sku,
+                "oos_count": oos,
+                "oos_rate": rate,
+                "low_stock_count": low,
+                "low_stock_rate": low_rate,
+                "sellable_stock_sum": float(r["sellable_stock_sum"] or 0),
+                "in_transit_sum": float(r["in_transit_sum"] or 0),
+                "kunshan_stock_sum": float(r["kunshan_stock_sum"] or 0),
+                "lm_sales_sum": float(r["lm_sales_sum"] or 0),
+                "lm_gmv_sum": float(r["lm_gmv_sum"] or 0),
+                "lm_gm_sum": float(r["lm_gm_sum"] or 0),
+                "active_sku_count": int(tag_active_sku_count.get(tag, 0)),
+                "no_sales_sku_count": int(tag_no_sales_sku_count.get(tag, 0)),
+                "est_turnover_days_active": round(est_turnover_days_active, 2),
+                "turnover_days_p50": round(p50, 2),
+                "turnover_days_p75": round(p75, 2),
+                "oos_daily_sales_loss_est": round(float(r["oos_lm_sales_sum"] or 0) / 30.0, 4),
+                "oos_daily_gmv_loss_est": round(float(r["oos_lm_gmv_sum"] or 0) / 30.0, 2),
+                "oos_daily_gm_loss_est": round(float(r["oos_lm_gm_sum"] or 0) / 30.0, 2),
+                "ytd_customer_sum": float(r["ytd_customer_sum"] or 0),
+                "ytd_sales_sum": float(r["ytd_sales_sum"] or 0),
+                "ytd_gmv_sum": float(r["ytd_gmv_sum"] or 0),
+                "ytd_revenue_sum": float(r["ytd_revenue_sum"] or 0),
+                "ytd_profit_sum": float(r["ytd_profit_sum"] or 0),
+                "ytd_daily_gmv_avg": round(float(r["ytd_gmv_sum"] or 0) / day_of_year, 2),
+                "ytd_daily_profit_avg": round(float(r["ytd_profit_sum"] or 0) / day_of_year, 2),
+            }
+        )
+    total_lm_daily_sales_active = total_active_sales_sum / 30.0
+    est_turnover_days_total_active = (total_active_stock_sum / total_lm_daily_sales_active) if total_lm_daily_sales_active > 0 else 0.0
+    total_p50 = _quantile(all_turnover_vals, 0.5)
+    total_p75 = _quantile(all_turnover_vals, 0.75)
+    oos_impact = cur = None
+    # derive impact by oos and low-stock buckets
+    conn2 = db_conn()
+    cur2 = conn2.cursor()
+    oos_impact = cur2.execute(
+        """
+        SELECT
+          SUM(last_month_sales_qty) AS lm_sales_sum,
+          SUM(last_month_gmv) AS lm_gmv_sum,
+          SUM(last_month_gm) AS lm_gm_sum,
+          SUM(ytd_gmv) AS ytd_gmv_sum,
+          SUM(ytd_gaap_profit) AS ytd_profit_sum
+        FROM inventory_stock_main_codes
+        WHERE batch_id=? AND sellable_stock<=0
+        """,
+        (stock_batch_id,),
+    ).fetchone()
+    low_impact = cur2.execute(
+        """
+        SELECT
+          SUM(last_month_sales_qty) AS lm_sales_sum,
+          SUM(last_month_gmv) AS lm_gmv_sum,
+          SUM(last_month_gm) AS lm_gm_sum,
+          SUM(ytd_gmv) AS ytd_gmv_sum,
+          SUM(ytd_gaap_profit) AS ytd_profit_sum
+        FROM inventory_stock_main_codes
+        WHERE batch_id=?
+          AND sellable_stock>0
+          AND last_month_sales_qty>0
+          AND jbp3_available>=0
+          AND (jbp3_available * 30.0 / last_month_sales_qty)<=15
+        """,
+        (stock_batch_id,),
+    ).fetchone()
+    conn2.close()
+    totals_dict = {
+        "sku_count": int(totals["sku_count"] or 0),
+        "oos_count": int(totals["oos_count"] or 0),
+        "oos_rate": round((float(totals["oos_count"] or 0) / float(totals["sku_count"] or 1)), 4),
+        "low_stock_count": int(totals["low_stock_count"] or 0),
+        "low_stock_rate": round((float(totals["low_stock_count"] or 0) / float(totals["sku_count"] or 1)), 4),
+        "sellable_stock_sum": float(totals["sellable_stock_sum"] or 0),
+        "in_transit_sum": float(totals["in_transit_sum"] or 0),
+        "kunshan_stock_sum": float(totals["kunshan_stock_sum"] or 0),
+        "lm_sales_sum": float(totals["lm_sales_sum"] or 0),
+        "lm_gmv_sum": float(totals["lm_gmv_sum"] or 0),
+        "lm_gm_sum": float(totals["lm_gm_sum"] or 0),
+        "active_sku_count": total_active_sku_count,
+        "no_sales_sku_count": total_no_sales_sku_count,
+        "est_turnover_days_active": round(est_turnover_days_total_active, 2),
+        "turnover_days_p50": round(total_p50, 2),
+        "turnover_days_p75": round(total_p75, 2),
+        "ytd_customer_sum": float(totals["ytd_customer_sum"] or 0),
+        "ytd_sales_sum": float(totals["ytd_sales_sum"] or 0),
+        "ytd_gmv_sum": float(totals["ytd_gmv_sum"] or 0),
+        "ytd_revenue_sum": float(totals["ytd_revenue_sum"] or 0),
+        "ytd_profit_sum": float(totals["ytd_profit_sum"] or 0),
+        "ytd_daily_gmv_avg": round(float(totals["ytd_gmv_sum"] or 0) / day_of_year, 2),
+        "ytd_daily_profit_avg": round(float(totals["ytd_profit_sum"] or 0) / day_of_year, 2),
+        "oos_daily_sales_loss_est": round(float(oos_impact["lm_sales_sum"] or 0) / 30.0, 4),
+        "oos_daily_gmv_loss_est": round(float(oos_impact["lm_gmv_sum"] or 0) / 30.0, 2),
+        "oos_daily_gm_loss_est": round(float(oos_impact["lm_gm_sum"] or 0) / 30.0, 2),
+        "oos_ytd_daily_gmv_impact_est": round(float(oos_impact["ytd_gmv_sum"] or 0) / day_of_year, 2),
+        "oos_ytd_daily_profit_impact_est": round(float(oos_impact["ytd_profit_sum"] or 0) / day_of_year, 2),
+        "low_daily_sales_risk_est": round(float(low_impact["lm_sales_sum"] or 0) / 30.0, 4),
+        "low_daily_gmv_risk_est": round(float(low_impact["lm_gmv_sum"] or 0) / 30.0, 2),
+        "low_daily_gm_risk_est": round(float(low_impact["lm_gm_sum"] or 0) / 30.0, 2),
+    }
+    # clear action lists (reference-style): urgent replenish & out-of-stock top
+    conn4 = db_conn()
+    cur4 = conn4.cursor()
+    urgent_rows = cur4.execute(
+        """
+        SELECT
+          analysis_main_code, product_name, department, product_tag, buyer,
+          sellable_stock, kunshan_in_transit, jbp3_available, last_month_gmv, last_month_sales_qty,
+          CASE WHEN last_month_sales_qty>0 THEN (jbp3_available * 30.0 / last_month_sales_qty) ELSE NULL END AS est_turnover_days_kunshan,
+          ytd_gmv
+        FROM inventory_stock_main_codes
+        WHERE batch_id=?
+          AND sellable_stock>0
+          AND last_month_sales_qty>0
+          AND jbp3_available>=0
+          AND (jbp3_available * 30.0 / last_month_sales_qty)<=15
+        ORDER BY last_month_gmv DESC
+        LIMIT 30
+        """,
+        (stock_batch_id,),
+    ).fetchall()
+    oos_rows = cur4.execute(
+        """
+        SELECT
+          analysis_main_code, product_name, department, product_tag, buyer,
+          sellable_stock, kunshan_in_transit, jbp3_available, last_month_gmv, last_month_customer_count, ytd_gmv
+        FROM inventory_stock_main_codes
+        WHERE batch_id=? AND sellable_stock<=0
+        ORDER BY last_month_gmv DESC
+        LIMIT 30
+        """,
+        (stock_batch_id,),
+    ).fetchall()
+    conn4.close()
+    urgent_items = [dict(r) for r in urgent_rows]
+    oos_items = [dict(r) for r in oos_rows]
+    oos_with_transit = sum(1 for r in oos_items if float(r.get("kunshan_in_transit") or 0) > 0)
+    totals_dict["oos_with_transit_top30"] = oos_with_transit
+    totals_dict["oos_without_transit_top30"] = max(len(oos_items) - oos_with_transit, 0)
+    return {
+        "stock_batch_id": stock_batch_id,
+        "items": items,
+        "totals": totals_dict,
+        "urgent_items": urgent_items,
+        "oos_items": oos_items,
+    }
+
+
+@app.get("/api/admin/reminders")
+def admin_list_reminders(status: str = Query(default="open")) -> dict[str, Any]:
+    conn = db_conn()
+    cur = conn.cursor()
+    rows = cur.execute(
+        """
+        SELECT * FROM inventory_reminders
+        WHERE status=? ORDER BY created_at DESC LIMIT 200
+        """,
+        (status,),
+    ).fetchall()
+    conn.close()
+    return {"items": [dict(r) for r in rows]}
+
+
+@app.post("/api/admin/reminders/{reminder_id}/done")
+def admin_mark_reminder_done(reminder_id: int) -> dict[str, Any]:
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE inventory_reminders SET status='done', updated_at=? WHERE id=?",
+        (now_iso(), reminder_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "ok"}
+
+
 @app.get("/api/admin/budget")
 def admin_budget() -> dict[str, Any]:
     setting = _get_llm_setting()
@@ -1764,6 +2564,7 @@ def ops_generate_strategies(
     candidate_source: str = Query(default="library"),
     use_ai: bool = Query(default=True),
     force_ai_only: bool = Query(default=False),
+    use_stock_filter: bool = Query(default=True),
 ) -> dict[str, Any]:
     conn = db_conn()
     cur = conn.cursor()
@@ -1776,6 +2577,7 @@ def ops_generate_strategies(
           sku_id,
           MIN(product_name) AS product_name,
           MIN(category) AS category,
+          MIN(standard_code) AS standard_code,
           AVG(price) AS price,
           AVG(cost) AS cost,
           SUM(qty) AS total_qty,
@@ -1794,6 +2596,7 @@ def ops_generate_strategies(
           sku_id,
           MIN(product_name) AS product_name,
           MIN(category) AS category,
+          MIN(standard_code) AS standard_code,
           AVG(price) AS price,
           AVG(cost) AS cost
         FROM uploaded_products
@@ -1803,8 +2606,38 @@ def ops_generate_strategies(
         (batch_id,),
     ).fetchall()
     library_candidates = cur.execute(
-        "SELECT sku_id, product_name, category, original_price AS price, cost FROM products WHERE active=1 AND role='addon'"
+        "SELECT sku_id, product_name, category, original_price AS price, cost, standard_code FROM products WHERE active=1 AND role='addon'"
     ).fetchall()
+
+    stock_filtered = {"enabled": bool(use_stock_filter), "applied": False, "mains": len(mains), "batch": len(batch_candidates), "library": len(library_candidates)}
+    if use_stock_filter:
+        try:
+            stock_batch_id = _latest_inventory_stock_batch_id()
+            if stock_batch_id:
+                avail = _get_available_standard_code_set(stock_batch_id)
+                if avail:
+                    mains = [
+                        m
+                        for m in mains
+                        if m["standard_code"] is not None and str(m["standard_code"]) in avail
+                    ]
+                    batch_candidates = [
+                        a
+                        for a in batch_candidates
+                        if a["standard_code"] is not None and str(a["standard_code"]) in avail
+                    ]
+                    library_candidates = [
+                        a
+                        for a in library_candidates
+                        if a["standard_code"] is not None and str(a["standard_code"]) in avail
+                    ]
+                    stock_filtered["applied"] = True
+                    stock_filtered["mains"] = len(mains)
+                    stock_filtered["batch"] = len(batch_candidates)
+                    stock_filtered["library"] = len(library_candidates)
+        except Exception as e:
+            conn.close()
+            raise HTTPException(status_code=500, detail=f"use_stock_filter error: {type(e).__name__}: {e}")
     if candidate_source == "batch":
         candidate_rows = batch_candidates
     elif candidate_source == "mixed":
@@ -1933,6 +2766,7 @@ def ops_generate_strategies(
             "candidate_pool_size": len(candidate_rows),
             "skip_no_candidates": skip_no_candidates,
             "skip_exception": skip_exception,
+            "stock_filtered": stock_filtered,
             "errors": errors,
         },
     }
@@ -2428,6 +3262,101 @@ def ops_list_strategies(
         d["source_label"] = "百炼AI" if source == "bailian_llm" else "规则引擎"
         items.append(d)
     return {"total": total, "items": items}
+
+
+def _bundle_export_reason_source(decision_payload: str | None) -> tuple[str, str]:
+    dp = decision_payload or ""
+    reason = "规则关联推理"
+    source_label = "规则引擎"
+    try:
+        p = json.loads(dp or "{}")
+        t = p.get("decision_trace") or {}
+        src = t.get("source", "rule_engine")
+        source_label = "百炼AI" if src == "bailian_llm" else "规则引擎"
+        if "medical_reason" in dp:
+            reason = "AI医学推理"
+        elif t.get("copy_style_name"):
+            reason = f"{t.get('copy_style_name')} / 规则关联推理"
+        elif isinstance(t.get("association_tags"), list) and t.get("association_tags"):
+            reason = " / ".join(str(x) for x in t["association_tags"][:2])
+    except Exception:
+        pass
+    return reason, source_label
+
+
+def _bundle_export_package_name(decision_payload: str | None) -> str:
+    try:
+        p = json.loads(decision_payload or "{}")
+        t = p.get("decision_trace") or {}
+        s = t.get("scene_title")
+        if s:
+            return str(s)
+    except Exception:
+        pass
+    return ""
+
+
+@app.get("/api/ops/strategies/export")
+def ops_export_strategies_csv(
+    batch_id: str,
+    status: str | None = None,
+) -> Response:
+    """导出当前批次组货方案为 CSV，列与运营后台表格基本一致。"""
+    conn = db_conn()
+    cur = conn.cursor()
+    where = ["batch_id=?"]
+    params: list[Any] = [batch_id]
+    if status:
+        where.append("status=?")
+        params.append(status)
+    where_sql = " AND ".join(where)
+    rows = cur.execute(
+        f"SELECT * FROM bundle_recommendations WHERE {where_sql} ORDER BY id DESC",
+        tuple(params),
+    ).fetchall()
+    conn.close()
+    header = [
+        "ID",
+        "套餐名称",
+        "商品A",
+        "商品A_SKU",
+        "建议搭配商品B",
+        "搭配B_SKU",
+        "组货卖点",
+        "组货原因",
+        "来源",
+        "商品价格(原价)",
+        "参考毛利",
+        "状态",
+    ]
+    lines = [",".join(header)]
+    for r in rows:
+        d = dict(r)
+        reason, source_label = _bundle_export_reason_source(d.get("decision_payload"))
+        pkg = _bundle_export_package_name(d.get("decision_payload"))
+        vals = [
+            d.get("id"),
+            pkg,
+            d.get("main_product_name", ""),
+            d.get("main_sku_id", ""),
+            d.get("selected_product_name", ""),
+            d.get("selected_sku_id", ""),
+            d.get("sales_copy", ""),
+            reason,
+            source_label,
+            f"{to_float(d.get('addon_price'), 0):.2f}",
+            f"{to_float(d.get('projected_profit'), 0):.2f}",
+            d.get("status", ""),
+        ]
+        esc = [f"\"{str(x).replace('\"', '\"\"')}\"" for x in vals]
+        lines.append(",".join(esc))
+    csv_text = "\ufeff" + "\n".join(lines)
+    filename = f"bundle_strategies_{batch_id}.csv"
+    return Response(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.post("/api/ops/strategies/{item_id}/confirm")
